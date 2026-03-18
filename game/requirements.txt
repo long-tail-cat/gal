@@ -1,0 +1,6 @@
+fastapi
+uvicorn
+httpx
+graphiti-core
+pydantic
+requests
