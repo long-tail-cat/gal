@@ -7,7 +7,12 @@ import json
 from dataclasses import dataclass
 from memory import GalgameMemory
 
-# 世界观和角色设定（你可以替换成自己的）
+# ─────────────────────────────────────────────
+# 配置常量（在这里统一修改）
+# ─────────────────────────────────────────────
+
+LLM_MODEL = "gemma3:4b"   # 修改这里来切换模型，例如 "gemma3:12b"
+
 WORLD_SETTING = """
 这是一个发生在现代都市的校园故事。
 主角是一名普通高中生，刚转学到新学校。
@@ -15,18 +20,18 @@ WORLD_SETTING = """
 """
 
 CHARACTER_SETTINGS = {
-    "爱丽丝": "蓝发眼镜少女，图书委员，表面冷淡内心温柔，喜欢看推理小说。",
+    "爱丽丝": "黑发眼镜少女，图书委员，表面冷淡内心温柔，喜欢看推理小说。",
     "小樱": "活泼开朗的橙发少女，社团干部，有点大大咧咧但很关心朋友。"
 }
 
 
 @dataclass
 class SceneResult:
-    narration: str           # 旁白
-    dialogues: list[dict]    # 对话列表 [{"character": "爱丽丝", "text": "..."}]
-    choices: list[str]       # 玩家选项
-    background: str          # 背景描述（用于生图）
-    character_emotions: dict # 各角色当前表情 {"爱丽丝": "shy"}
+    narration: str
+    dialogues: list[dict]
+    choices: list[str]
+    background: str
+    character_emotions: dict
 
 
 class SceneGenerator:
@@ -40,26 +45,22 @@ class SceneGenerator:
         location: str,
         characters: list[str]
     ) -> SceneResult:
-        """
-        根据玩家输入和当前场景生成下一段剧情
-        """
-        # 1. 获取记忆上下文
+
         context = await self.memory.get_context(
             f"{player_input} {location} {' '.join(characters)}",
             characters
         )
 
-        # 2. 拼接角色设定
         char_settings = "\n".join([
             f"- {name}：{desc}"
             for name, desc in CHARACTER_SETTINGS.items()
             if name in characters
         ])
 
-        # 3. 构建生成 prompt
         prompt = f"""
 你是一个 Galgame 的剧本引擎，请根据以下信息生成下一段剧情。
-
+只输出 JSON，不要有任何多余文字或 markdown。
+请生成8~12句角色对话。
 【世界观】
 {WORLD_SETTING}
 
@@ -74,21 +75,21 @@ class SceneGenerator:
 在场角色：{', '.join(characters)}
 玩家行动/输入：{player_input}
 
-请以 JSON 格式返回，不要有多余文字：
+输出格式：
 {{
-  "narration": "旁白描述，2~4句话",
+  "narration": "旁白描述，0~4句话",
   "dialogues": [
     {{"character": "角色名", "text": "对话内容"}},
-    ...
+    {{"character": "角色名", "text": "对话内容"}}
   ],
   "choices": ["选项1", "选项2", "选项3"],
-  "background": "背景的英文描述，用于生图，例如 school library, warm lighting, bookshelves",
-  "character_emotions": {{"角色名": "表情，例如 smile/shy/serious/surprised"}}
+  "background": "英文背景描述，用于生图，例如 school library, warm lighting, bookshelves",
+  "character_emotions": {{"角色名": "smile或shy或serious或surprised或neutral之一"}}
 }}
 """
 
         response = await self.llm_client.client.chat.completions.create(
-            model="gemma3:12b",
+            model=LLM_MODEL,
             messages=[{"role": "user", "content": prompt}]
         )
 
@@ -99,7 +100,6 @@ class SceneGenerator:
             data = json.loads(raw)
         except Exception as e:
             print(f"[SceneGenerator] JSON解析失败: {e}\n原始输出:\n{raw}")
-            # 返回兜底内容
             data = {
                 "narration": "（剧情生成出现问题，请重试）",
                 "dialogues": [],

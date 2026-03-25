@@ -91,7 +91,7 @@ class GalgameMemory:
         """初始化 Graphiti 连接"""
         self.llm_client = OpenAIGenericClient(config=LLMConfig(
             api_key="ollama",
-            model="gemma3:12b",
+            model="gemma3:4b",
             base_url="http://localhost:11434/v1",
             temperature=0.1
         ))
@@ -104,7 +104,7 @@ class GalgameMemory:
         ))
 
         neo4j_driver = Neo4jDriver(
-            uri="neo4j://127.0.0.1:7687",
+            uri="bolt://127.0.0.1:7687",
             user="neo4j",
             password="12345678"
         )
@@ -131,6 +131,7 @@ class GalgameMemory:
     # ── 写入记忆 ──────────────────────────────
 
     async def save_episode(self, scene_text: str, player_choice: str, characters: list[str]):
+        return#我加的，暂时不写入记忆了
         """
         一个场景结束后，提取关键事实写入图谱，同时更新角色情感状态
         """
@@ -158,7 +159,7 @@ class GalgameMemory:
 }}
 """
         response = await self.llm_client.client.chat.completions.create(
-            model="gemma3:12b",
+            model="gemma3:4b",
             messages=[{"role": "user", "content": extract_prompt}]
         )
 

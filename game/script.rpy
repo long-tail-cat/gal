@@ -1,32 +1,32 @@
 # game/script.rpy
-# Ren'Py 调用中间层的示例脚本
+# 持续游戏循环 + 生图显示
 
 init python:
     import requests
     import json
     import os
+    import time
 
     SERVER_URL = "http://127.0.0.1:8000"
+    GENERATED_IMAGE_PATH = "images/generated/current_scene.png"
 
     def call_next_scene(player_input, location, characters):
-        """请求下一段剧情"""
         try:
             resp = requests.post(f"{SERVER_URL}/next_scene", json={
                 "player_input": player_input,
                 "location": location,
                 "characters": characters
-            }, timeout=60)
+            }, timeout=120)
             return resp.json()
         except Exception as e:
             return {
                 "narration": f"（连接服务器失败：{e}）",
                 "dialogues": [],
-                "choices": ["重试", "跳过"],
+                "choices": ["重试"],
                 "image_triggered": False
             }
 
     def save_episode(scene_text, player_choice, characters):
-        """保存场景记忆"""
         try:
             requests.post(f"{SERVER_URL}/save_episode", json={
                 "scene_text": scene_text,
@@ -36,44 +36,85 @@ init python:
         except:
             pass
 
+    def wait_for_image(timeout=60):
+        """
+        等待新图片生成完毕，返回 True 或 False
+        通过轮询 /image_ready 接口实现
+        """
+        try:
+            # 先记录当前图片时间戳
+            resp = requests.get(f"{SERVER_URL}/image_ready", timeout=5)
+            old_mtime = resp.json().get("mtime", 0)
+        except:
+            return False
+
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                resp = requests.get(f"{SERVER_URL}/image_ready", timeout=5)
+                data = resp.json()
+                if data.get("ready") and data.get("mtime", 0) > old_mtime:
+                    return True
+            except:
+                pass
+            time.sleep(1)
+        return False
+
     def get_character_affection(name):
-        """获取角色好感度"""
         try:
             resp = requests.get(f"{SERVER_URL}/character_state/{name}", timeout=10)
             return resp.json().get("affection", 50)
         except:
             return 50
 
+
 # ─── 游戏开始 ───────────────────────────────
 
 label start:
-
-    # 初始场景：图书馆遇到爱丽丝
     $ current_location = "学校图书馆"
     $ current_characters = ["爱丽丝"]
+    $ player_choice = "走进图书馆，四处张望"
     $ scene_log = []
 
-    # 请求第一段剧情
-    $ scene = call_next_scene("走进图书馆，四处张望", current_location, current_characters)
+    # 主游戏循环
+label game_loop:
 
-    # 显示旁白
-    narrator "[scene['narration']]"
+    # 1. 请求下一段剧情
+    $ scene = call_next_scene(player_choice, current_location, current_characters)
 
-    # 显示对话
+    # 2. 等待图片生成（最多等100秒，超时就跳过）
+    $ image_ready = wait_for_image(100)
+
+    # 3. 如果图片就绪则显示，否则用纯色背景
+    if image_ready and renpy.loadable(GENERATED_IMAGE_PATH):
+        scene black
+        show expression GENERATED_IMAGE_PATH as scene_bg
+    else:
+        scene black
+
+    # 4. 显示旁白
+    $ narration = scene.get("narration", "")
+    if narration:
+        narrator "[narration]"
+
+    # 5. 逐行显示对话
     $ dialogues = scene.get("dialogues", [])
-    $ i = 0
-    while i < len(dialogues):
-        $ d = dialogues[i]
+    $ idx = 0
+    while idx < len(dialogues):
+        $ d = dialogues[idx]
         $ speaker = d.get("character", "???")
         $ line = d.get("text", "")
         "[speaker]" "[line]"
-        $ i += 1
+        $ idx += 1
 
-    # 记录本场景内容用于写入记忆
-    $ scene_log.append(scene['narration'])
+    # 6. 记录场景内容
+    $ scene_log = [narration] + [d.get("text","") for d in dialogues]
+    $ scene_text = " ".join(scene_log)
 
-    # 显示选项
+    # 7. 显示选项
     $ choices = scene.get("choices", ["继续"])
+    $ player_choice = choices[0]
+
     menu:
         "[choices[0]]" if len(choices) > 0:
             $ player_choice = choices[0]
@@ -82,28 +123,8 @@ label start:
         "[choices[2]]" if len(choices) > 2:
             $ player_choice = choices[2]
 
-    # 保存记忆
-    $ save_episode(
-        scene_text=" ".join(scene_log),
-        player_choice=player_choice,
-        characters=current_characters
-    )
+    # 8. 保存记忆
+    $ save_episode(scene_text, player_choice, current_characters)
 
-    # 根据选择生成下一段剧情
-    $ scene = call_next_scene(player_choice, current_location, current_characters)
-    narrator "[scene['narration']]"
-
-    $ dialogues = scene.get("dialogues", [])
-    $ i = 0
-    while i < len(dialogues):
-        $ d = dialogues[i]
-        $ speaker = d.get("character", "???")
-        $ line = d.get("text", "")
-        "[speaker]" "[line]"
-        $ i += 1
-
-    # 查询好感度并显示
-    $ affection = get_character_affection("爱丽丝")
-    "（爱丽丝好感度：[affection]/100）"
-
-    return
+    # 9. 循环继续
+    jump game_loop

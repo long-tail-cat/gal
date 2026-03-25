@@ -7,6 +7,8 @@ import asyncio
 import sys
 import httpx
 import json
+import os
+import glob
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from pydantic import BaseModel
@@ -18,6 +20,16 @@ if sys.platform.startswith('win'):
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 # ─────────────────────────────────────────────
+# 配置常量（在这里统一修改）
+# ─────────────────────────────────────────────
+
+IMAGE_MODEL = "counterfeitxl_v25.safetensors"   # 生图模型文件名
+COMFYUI_URL = "http://127.0.0.1:8188"
+COMFYUI_OUTPUT_DIR = r"C:\Users\Administrator\ComfyUI\output"
+RENPY_IMAGE_DIR = r"C:\Users\Administrator\Desktop\test_gal\game\images\generated"
+
+
+# ─────────────────────────────────────────────
 # 全局实例
 # ─────────────────────────────────────────────
 
@@ -27,6 +39,8 @@ generator: SceneGenerator = None
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global generator
+    # 确保 Ren'Py 图片目录存在
+    os.makedirs(RENPY_IMAGE_DIR, exist_ok=True)
     await memory.init()
     generator = SceneGenerator(memory)
     print("[Server] 启动完成，等待 Ren'Py 连接...")
@@ -36,45 +50,38 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
-COMFYUI_URL = "http://127.0.0.1:8188"
-
 
 # ─────────────────────────────────────────────
 # 请求/响应模型
 # ─────────────────────────────────────────────
 
 class PlayerAction(BaseModel):
-    player_input: str        # 玩家输入或选择
-    location: str            # 当前地点
-    characters: list[str]    # 在场角色
+    player_input: str
+    location: str
+    characters: list[str]
 
 class SceneResponse(BaseModel):
     narration: str
     dialogues: list[dict]
     choices: list[str]
-    image_triggered: bool    # 是否已触发生图
+    image_triggered: bool
 
 
 # ─────────────────────────────────────────────
-# ComfyUI 生图（异步触发，不阻塞剧情返回）
+# ComfyUI 生图
 # ─────────────────────────────────────────────
 
 async def trigger_image_generation(background: str, character_emotions: dict):
-    """
-    向 ComfyUI 发送生图请求
-    这里使用简化的 prompt，你可以根据需要扩展 workflow
-    """
-    # 拼接角色表情到 prompt
     char_prompts = ", ".join([
-        f"{name} {emotion}" for name, emotion in character_emotions.items()
+        f"{emotion}" for name, emotion in character_emotions.items()
     ])
 
     positive_prompt = (
         f"masterpiece, best quality, anime style, {background}, "
-        f"2girls, cat ears, {char_prompts}, soft lighting, detailed"
+        f"1girl, {char_prompts}, soft lighting, detailed eyes, "
+        f"ultra-detailed, highres"
     )
 
-    # ComfyUI API 的简化 workflow（文生图）
     workflow = {
         "3": {
             "class_type": "KSampler",
@@ -93,7 +100,7 @@ async def trigger_image_generation(background: str, character_emotions: dict):
         },
         "4": {
             "class_type": "CheckpointLoaderSimple",
-            "inputs": {"ckpt_name": "counterfeitV30_v30.safetensors"}
+            "inputs": {"ckpt_name": IMAGE_MODEL}
         },
         "5": {
             "class_type": "EmptyLatentImage",
@@ -107,7 +114,7 @@ async def trigger_image_generation(background: str, character_emotions: dict):
             "class_type": "CLIPTextEncode",
             "inputs": {
                 "clip": ["4", 1],
-                "text": "worst quality, low quality, bad anatomy, extra fingers, watermark, text, nsfw"
+                "text": "worst quality, low quality, bad anatomy, extra fingers, watermark, text, nsfw, multiple girls"
             }
         },
         "8": {
@@ -122,14 +129,44 @@ async def trigger_image_generation(background: str, character_emotions: dict):
 
     try:
         async with httpx.AsyncClient() as client:
-            await client.post(
+            resp = await client.post(
                 f"{COMFYUI_URL}/prompt",
                 json={"prompt": workflow},
                 timeout=10.0
             )
         print(f"[Image] 已触发生图：{background}")
+
+        # 等待生图完成后复制到 Ren'Py 目录
+        asyncio.create_task(wait_and_copy_image())
+
     except Exception as e:
         print(f"[Image] 生图触发失败: {e}")
+
+
+async def wait_and_copy_image():
+    """
+    等待 ComfyUI 生成完成，把最新的图片复制到 Ren'Py images 目录
+    文件名固定为 current_scene.png，Ren'Py 始终读取这一个文件
+    """
+    import shutil
+
+    # 记录触发前的最新文件时间，用于判断新图是否生成完毕
+    await asyncio.sleep(3)  # 等待 ComfyUI 开始生成
+
+    for _ in range(60):  # 最多等 60 秒
+        files = glob.glob(os.path.join(COMFYUI_OUTPUT_DIR, "galgame*.png"))
+        if files:
+            latest = max(files, key=os.path.getmtime)
+            dest = os.path.join(RENPY_IMAGE_DIR, "current_scene.png")
+            try:
+                shutil.copy2(latest, dest)
+                print(f"[Image] 已复制图片到 Ren'Py: {dest}")
+                return
+            except Exception as e:
+                print(f"[Image] 复制图片失败: {e}")
+        await asyncio.sleep(1)
+
+    print("[Image] 等待生图超时")
 
 
 # ─────────────────────────────────────────────
@@ -138,17 +175,12 @@ async def trigger_image_generation(background: str, character_emotions: dict):
 
 @app.post("/next_scene", response_model=SceneResponse)
 async def next_scene(action: PlayerAction):
-    """
-    Ren'Py 调用此接口获取下一段剧情
-    """
-    # 生成剧情
     result = await generator.generate(
         player_input=action.player_input,
         location=action.location,
         characters=action.characters
     )
 
-    # 异步触发生图（不等待，不阻塞）
     asyncio.create_task(
         trigger_image_generation(result.background, result.character_emotions)
     )
@@ -163,9 +195,6 @@ async def next_scene(action: PlayerAction):
 
 @app.post("/save_episode")
 async def save_episode(data: dict):
-    """
-    场景结束后，Ren'Py 调用此接口保存记忆
-    """
     await memory.save_episode(
         scene_text=data["scene_text"],
         player_choice=data["player_choice"],
@@ -176,9 +205,6 @@ async def save_episode(data: dict):
 
 @app.get("/character_state/{name}")
 async def character_state(name: str):
-    """
-    查询某个角色当前状态（好感度等）
-    """
     from memory import get_or_create_character
     char = get_or_create_character(memory.character_states, name)
     return {
@@ -190,14 +216,22 @@ async def character_state(name: str):
     }
 
 
+@app.get("/image_ready")
+async def image_ready():
+    """
+    Ren'Py 轮询此接口，检查新图片是否已就绪
+    """
+    dest = os.path.join(RENPY_IMAGE_DIR, "current_scene.png")
+    if os.path.exists(dest):
+        mtime = os.path.getmtime(dest)
+        return {"ready": True, "mtime": mtime}
+    return {"ready": False, "mtime": 0}
+
+
 @app.get("/health")
 async def health():
     return {"status": "ok"}
 
-
-# ─────────────────────────────────────────────
-# 启动
-# ─────────────────────────────────────────────
 
 if __name__ == "__main__":
     import uvicorn
