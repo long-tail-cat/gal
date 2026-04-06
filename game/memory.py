@@ -15,25 +15,23 @@ from graphiti_core.llm_client.openai_generic_client import OpenAIGenericClient, 
 from graphiti_core.embedder.openai import OpenAIEmbedder, OpenAIEmbedderConfig
 from graphiti_core.driver.neo4j_driver import Neo4jDriver
 
-# Windows 异步修复
 if sys.platform.startswith('win'):
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 os.environ["OPENAI_API_KEY"] = "ollama"
 os.environ["OPENAI_BASE_URL"] = "http://localhost:11434/v1"
 
-
 # ─────────────────────────────────────────────
-# 角色情感状态（结构化，独立于图谱存储）
+# 角色情感状态
 # ─────────────────────────────────────────────
 
 @dataclass
 class CharacterState:
     name: str
-    affection: int = 50       # 好感度 0~100
-    trust: int = 50           # 信任度 0~100
-    mood: str = "neutral"     # 当前情绪
-    relationship: str = "陌生人"  # 关系标签
+    affection: int = 50
+    trust: int = 50
+    mood: str = "neutral"
+    relationship: str = "陌生人"
 
     def to_prompt_text(self) -> str:
         return (
@@ -54,19 +52,20 @@ class CharacterState:
 
 
 # ─────────────────────────────────────────────
-# 情感状态持久化（存 JSON 文件）
+# 情感状态持久化
 # ─────────────────────────────────────────────
 
-STATE_FILE = "character_states.json"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+STATE_FILE = os.path.join(BASE_DIR, "character_states.json")
 
-def load_character_states() -> dict[str, CharacterState]:
+def load_character_states() -> dict:
     if not os.path.exists(STATE_FILE):
         return {}
     with open(STATE_FILE, "r", encoding="utf-8") as f:
         data = json.load(f)
     return {name: CharacterState(**state) for name, state in data.items()}
 
-def save_character_states(states: dict[str, CharacterState]):
+def save_character_states(states: dict):
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump({name: asdict(s) for name, s in states.items()}, f, ensure_ascii=False, indent=2)
 
@@ -86,12 +85,16 @@ class GalgameMemory:
         self.graphiti: Graphiti = None
         self.llm_client: OpenAIGenericClient = None
         self.character_states = load_character_states()
+        # 用于积累对话，达到阈值才写入图谱
+        self._pending_lines: list[str] = []
+        self._pending_characters: set = set()
+        self._flush_threshold = 5  # 每积累5轮对话写入一次
 
     async def init(self):
-        """初始化 Graphiti 连接"""
+        from scene_generator import LLM_MODEL
         self.llm_client = OpenAIGenericClient(config=LLMConfig(
             api_key="ollama",
-            model="gemma3:4b",
+            model=LLM_MODEL,
             base_url="http://localhost:11434/v1",
             temperature=0.1
         ))
@@ -114,34 +117,34 @@ class GalgameMemory:
             embedder=embedder,
             graph_driver=neo4j_driver
         )
-        # 在独立task中运行，避免FastAPI lifespan的事件循环冲突
         try:
             task = asyncio.ensure_future(self.graphiti.build_indices_and_constraints())
             await asyncio.wait_for(task, timeout=30)
         except asyncio.TimeoutError:
-            print("[Memory] 索引建立超时，继续启动（索引可能已存在）")
+            print("[Memory] 索引建立超时，继续启动")
         except Exception as e:
             print(f"[Memory] 索引建立警告（可忽略）: {e}")
         print("[Memory] 初始化完成")
 
     async def close(self):
+        # 关闭前把剩余的pending内容写入
+        if self._pending_lines:
+            await self._flush_to_graph()
         if self.graphiti:
             await self.graphiti.close()
 
     # ── 写入记忆 ──────────────────────────────
 
     async def save_episode(self, scene_text: str, player_choice: str, characters: list[str]):
-        return#我加的，暂时不写入记忆了
         """
-        一个场景结束后，提取关键事实写入图谱，同时更新角色情感状态
+        积累对话内容，达到阈值后批量写入图谱。
+        同时立即更新角色情感状态（不等积累）。
         """
-        # 用 LLM 从场景中提取结构化信息
+        # 先用 LLM 提取角色状态变化（每轮都做）
         extract_prompt = f"""
 从以下游戏场景中提取关键信息，以 JSON 格式返回，不要有多余文字。
 
-场景内容：
-{scene_text}
-
+场景内容：{scene_text}
 玩家选择：{player_choice}
 在场角色：{', '.join(characters)}
 
@@ -151,36 +154,25 @@ class GalgameMemory:
   "character_changes": [
     {{
       "name": "角色名",
-      "affection_delta": 数字（-10到10，玩家选择对该角色好感度的影响）,
+      "affection_delta": 数字（-10到10）,
       "trust_delta": 数字（-10到10）,
-      "mood": "角色当前情绪（happy/sad/angry/nervous/neutral等）"
+      "mood": "角色当前情绪"
     }}
   ]
 }}
 """
-        response = await self.llm_client.client.chat.completions.create(
-            model="gemma3:4b",
-            messages=[{"role": "user", "content": extract_prompt}]
-        )
-
         try:
-            raw = response.choices[0].message.content
-            # 去掉可能的 markdown 代码块
-            raw = raw.strip().strip("```json").strip("```").strip()
+            response = await self.llm_client.client.chat.completions.create(
+                model=self.llm_client.config.model,
+                messages=[{"role": "user", "content": extract_prompt}]
+            )
+            raw = response.choices[0].message.content.strip().strip("```json").strip("```").strip()
             extracted = json.loads(raw)
         except Exception as e:
-            print(f"[Memory] 提取失败，使用原始文本写入: {e}")
-            extracted = {"event_summary": scene_text[:200], "character_changes": []}
+            print(f"[Memory] 提取失败: {e}")
+            extracted = {"event_summary": scene_text[:100], "character_changes": []}
 
-        # 写入图谱
-        await self.graphiti.add_episode(
-            name=f"scene_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
-            episode_body=extracted["event_summary"],
-            source_description="galgame场景",
-            reference_time=datetime.now()
-        )
-
-        # 更新角色情感状态
+        # 更新角色情感状态（立即）
         for change in extracted.get("character_changes", []):
             name = change.get("name")
             if name in characters:
@@ -190,28 +182,56 @@ class GalgameMemory:
                     trust_delta=change.get("trust_delta", 0),
                     mood=change.get("mood")
                 )
-
         save_character_states(self.character_states)
-        print(f"[Memory] 已写入场景记忆：{extracted['event_summary']}")
+
+        # 积累到 pending，按角色分组写入图谱
+        summary = extracted.get("event_summary", scene_text[:100])
+        self._pending_lines.append(f"[{player_choice}] {summary}")
+        for c in characters:
+            self._pending_characters.add(c)
+
+        # 达到阈值才写入图谱
+        if len(self._pending_lines) >= self._flush_threshold:
+            await self._flush_to_graph()
+
+    async def _flush_to_graph(self):
+        """把积累的内容按角色写入图谱"""
+        if not self._pending_lines:
+            return
+
+        combined = "；".join(self._pending_lines)
+
+        # 每个角色写一个 episode，这样图谱里按角色组织
+        for char_name in self._pending_characters:
+            try:
+                await self.graphiti.add_episode(
+                    name=f"{char_name}_{datetime.now().strftime('%Y%m%d_%H%M')}",
+                    episode_body=f"关于{char_name}的记忆：{combined}",
+                    source_description=f"角色{char_name}的互动记录",
+                    reference_time=datetime.now()
+                )
+                print(f"[Memory] 已写入 {char_name} 的记忆（{len(self._pending_lines)}轮）")
+            except Exception as e:
+                print(f"[Memory] 写入图谱失败: {e}")
+
+        self._pending_lines.clear()
+        self._pending_characters.clear()
 
     # ── 读取记忆 ──────────────────────────────
 
     async def get_context(self, current_situation: str, characters: list[str]) -> str:
-        """
-        查询和当前场景相关的记忆，返回格式化的上下文字符串供 LLM 使用
-        """
-        # 从图谱检索相关事件记忆
-        results = await self.graphiti.search(current_situation, num_results=5)
+        try:
+            results = await self.graphiti.search(current_situation, num_results=5)
+            memory_lines = []
+            for res in results:
+                fact = res.fact if hasattr(res, 'fact') else str(res)
+                time = res.valid_at.strftime('%Y-%m-%d') if hasattr(res, 'valid_at') and res.valid_at else "未知时间"
+                memory_lines.append(f"- [{time}] {fact}")
+            memory_text = "\n".join(memory_lines) if memory_lines else "（暂无相关记忆）"
+        except Exception as e:
+            print(f"[Memory] 查询记忆失败: {e}")
+            memory_text = "（暂无相关记忆）"
 
-        memory_lines = []
-        for res in results:
-            fact = res.fact if hasattr(res, 'fact') else str(res)
-            time = res.valid_at.strftime('%Y-%m-%d') if hasattr(res, 'valid_at') and res.valid_at else "未知时间"
-            memory_lines.append(f"- [{time}] {fact}")
-
-        memory_text = "\n".join(memory_lines) if memory_lines else "（暂无相关记忆）"
-
-        # 拼接角色情感状态
         char_state_lines = []
         for name in characters:
             char = get_or_create_character(self.character_states, name)

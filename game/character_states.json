@@ -1,9 +1,16 @@
 {
   "爱丽丝": {
     "name": "爱丽丝",
-    "affection": 61,
-    "trust": 54,
-    "mood": "focused",
+    "affection": 100,
+    "trust": 100,
+    "mood": "友善",
+    "relationship": "陌生人"
+  },
+  "瑶光": {
+    "name": "瑶光",
+    "affection": 70,
+    "trust": 66,
+    "mood": "未知",
     "relationship": "陌生人"
   }
 }
